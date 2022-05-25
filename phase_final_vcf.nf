@@ -22,11 +22,16 @@ params.ref_prefix = "/gpfs/gibbs/pi/tucci/pfr8/refs"
 params.ref = "${params.ref_prefix}/1kGP/hs37d5/hs37d5.fa"
 
 //Set up the channels of BAMs and their indices:
+//This variable is just used to allow merging to occur asynchronously for the chromosomes, rather than waiting for all whatshap jobs to finish:
+//TODO: Cross-check this value against the number of VCFs from the split, and error if there's a mismatch as this indicates sample mismatch(es)
+//      in the VCF or BAMs provided.
+num_samples = file(params.bam_glob, checkIfExists: true).size()
+println "Found ${num_samples} BAMs in the input directory"
 Channel
    .fromPath(params.bam_glob, checkIfExists: true)
    .ifEmpty { error "Unable to find BAMs matching glob: ${params.bam_glob}" }
    .map { bam -> return [(bam.getSimpleName() =~ params.bam_regex)[0][1], bam] }
-   .tap { bams, bams_tocount }
+   .tap { bams }
    .subscribe { println "Added ${it[0]} (${it[1]}) to bams channel" }
 Channel
    .fromPath(params.bam_glob+".bai", checkIfExists: true)
@@ -34,10 +39,6 @@ Channel
    .map { bai -> return [(bai.getSimpleName() =~ params.bam_regex)[0][1], bai] }
    .tap { bais }
    .subscribe { println "Added ${it[0]} (${it[1]}) to bais channel" }
-//This variable is just used to allow merging to occur asynchronously for the chromosomes, rather than waiting for all whatshap jobs to finish:
-//TODO: Cross-check this value against the number of VCFs from the split, and error if there's a mismatch (as this indicates sample mismatch(es)
-//      in the VCF or BAMs provided.
-num_samples = bam_tocount.count()
 
 //Set up the channels of input chromosomal VCFs and their indices:
 Channel
@@ -70,19 +71,21 @@ Channel
 
 //Default parameter values:
 //Regexes for parsing metadata from intermediate filenames:
-persample_vcf_regex = ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/
+//params.persample_vcf_regex = ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/
 //ShapeIt4 parameters:
 //PRNG seed for reproducibility -- default is "15052011", though note that a run will only be reproducible if the number of threads is 1
 params.prng_seed = '42'
 //"Use phase sets in input files assuming an error rate of [FLOAT]" -- default is NA, but recommended to set to 0.0001
-ps_errorrate = '0.0001'
+params.ps_errorrate = '0.0001'
 //"iteration scheme for the MCMC" -- default is 5b,1p,1b,1p,1b,1p,5m, but 10b,1p,1b,1p,1b,1p,1b,1p,10m is suggested for greater accuracy if runtime isn't constrained
-mcmc_scheme = '10b,1p,1b,1p,1b,1p,1b,1p,10m'
+params.mcmc_scheme = '10b,1p,1b,1p,1b,1p,1b,1p,10m'
 //"Depth of PBWT indexes to condition on" -- default is 4, but 8 is suggested for greater accuracy if runtime isn't constrained
-pbwt_depth = '8'
-if (params.faster_shapeit) {
-   mcmc_scheme = '5b,1p,1b,1p,1b,1p,5m'
-   pbwt_depth = '4'
+params.pbwt_depth = '8'
+//Default to not overwrite the more accurate ShapeIt4 parameters:
+params.faster_shapeit = 0
+if (params.faster_shapeit > 0) {
+   params.mcmc_scheme = '5b,1p,1b,1p,1b,1p,5m'
+   params.pbwt_depth = '4'
 }
 
 //Defaults for cpus, memory, and time for each process:
@@ -123,8 +126,8 @@ process filter_and_split {
 
    output:
    tuple path("bcftools_query_listsamples_chr${chr}.stderr"), path("bcftools_view_filterPASS_chr${chr}.stderr"), path("whatshap_unphase_chr${chr}.stderr"), path("bcftools_split_chr${chr}.stderr"), path("bcftools_split_chr${chr}.stdout") into filter_split_logs
-   path("chr${chr}_*_unphased.vcf.gz") into unphased_persample_vcfs
-   path("chr${chr}_*_unphased.vcf.gz.tbi") into unphased_persample_tbis
+   path("chr${chr}_*_unphased.vcf.gz") into unphased_persample_vcfs mode flatten
+   path("chr${chr}_*_unphased.vcf.gz.tbi") into unphased_persample_tbis mode flatten
 
    shell:
    '''
@@ -135,7 +138,7 @@ process filter_and_split {
    #Set up the per-sample per-chromosome VCFs for whatshap:
    #First we need a sample map TSV:
    bcftools query -l !{vcf} 2> bcftools_query_listsamples_chr!{chr}.stderr | \
-      awk -v "chrom=!{chr}" 'BEGIN{OFS="\t";}!/^Altai|Denisova|Vindija|Chagyrskaya|pan_troglodytes/{print $1, "-", "chr"chrom"_"$1"_unphased";}' > sample_VCF_map.tsv
+      !{projectDir}/samples_to_map_noArcPanTro.awk -v "chrom=!{chr}" > sample_VCF_map.tsv
    #Now do the filtering, removal of phasing from GATK, and splitting by sample:
    bcftools view -f PASS !{vcf} 2> bcftools_view_filterPASS_chr!{chr}.stderr | \
       whatshap unphase - 2> whatshap_unphase_chr!{chr}.stderr | \
@@ -152,7 +155,7 @@ process whatshap {
    tag "chr${chr} ${id}"
 
    cpus params.whatshap_cpus
-   memory { params.whatshap_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
+   memory { params.whatshap_mem.plus(task.attempt.minus(1).multiply(16))+' GB' }
    time { task.attempt == 2 ? '24h' : params.whatshap_timeout }
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
@@ -160,7 +163,7 @@ process whatshap {
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
-   tuple val(id), val(chr), path("chr${chr}_${id}_unphased.vcf.gz"), path("chr${chr}_${id}_unphased.vcf.gz.tbi"), path(bam), path(bai) from unphased_persample_vcfs.flatten().map({ vcf -> [(vcf.getSimpleName() =~ persample_vcf_regex)[0][2], (vcf.getSimpleName() =~ persample_vcf_regex)[0][1], vcf] }).join(unphased_persample_tbis.flatten().map({ tbi -> [(tbi.getSimpleName() =~ persample_vcf_regex)[0][2], (tbi.getSimpleName() =~ persample_vcf_regex)[0][1], tbi] }), by: [0,1], failOnMismatch: true).combine(bams.join(bais, by: 0, failOnMismatch: true), by: 0)
+   tuple val(id), val(chr), path("chr${chr}_${id}_unphased.vcf.gz"), path("chr${chr}_${id}_unphased.vcf.gz.tbi"), path(bam), path(bai) from unphased_persample_vcfs.flatten().map({ vcf -> [(vcf.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][2], (vcf.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][1], vcf] }).join(unphased_persample_tbis.flatten().map({ tbi -> [(tbi.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][2], (tbi.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][1], tbi] }), by: [0,1], failOnMismatch: true).combine(bams.join(bais, by: 0, failOnMismatch: true), by: 0)
    path ref
    path ref_fai
 
@@ -175,7 +178,7 @@ process whatshap {
    module load !{params.mod_htslib}
    module load !{params.mod_miniconda}
    conda activate whatshap
-   whatshap phase -r !{ref} --chromosome !{chr} !{whatshap_params} -o chr!{chr}_!{id}_phased.vcf.gz chr!{chr}_!{id}_unphased.vcf.gz !{bam} 2> 
+   whatshap phase -r !{ref} --chromosome !{chr} !{whatshap_params} -o chr!{chr}_!{id}_phased.vcf.gz chr!{chr}_!{id}_unphased.vcf.gz !{bam} 2> whatshap_phase_chr!{chr}_!{id}.stderr > whatshap_phase_chr!{chr}_!{id}.stdout
    tabix -f chr!{chr}_!{id}_phased.vcf.gz
    '''
 }
@@ -184,7 +187,7 @@ process merge {
    tag "chr${chr}"
 
    cpus params.merge_cpus
-   memory { params.merge_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
+   memory { params.merge_mem.plus(task.attempt.minus(1).multiply(16))+' GB' }
    time { task.attempt == 2 ? '48h' : params.merge_timeout }
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
@@ -197,18 +200,18 @@ process merge {
 
    output:
    tuple path("bcftools_merge_persample_chr${chr}.stderr"), path("bcftools_merge_persample_chr${chr}.stdout") into merge_logs
-   tuple val(chr), path("chr${chr}_persample_phased.vcf.gz"), path("chr${chr}_persample_phased.vcf.gz.tbi") into whatshap_merged_vcfs,whatshap_phased_vcfs
+   tuple val(chr), path("chr${chr}_persample_phased.vcf.gz"), path("chr${chr}_persample_phased.vcf.gz.tbi") into whatshap_merged_vcfs
+   tuple val(chr), val("whatshap"), path("chr${chr}_persample_phased.vcf.gz"), path("chr${chr}_persample_phased.vcf.gz.tbi") into whatshap_phased_vcfs
 
    shell:
    '''
    module load !{params.mod_bcftools}
    module load !{params.mod_htslib}
-   //Re-join the per-sample VCFs into one phased merged VCF (without archaics/PanTro):
-   //Generate the sorted list of VCFs:
-   find . -mindepth 1 -maxdepth 1 -type f -name "chr*_phased.vcf.gz" -print | \
-      cut -f2 -d"/" | \
+   #Re-join the per-sample VCFs into one phased merged VCF (without archaics/PanTro):
+   #Generate the sorted list of VCFs:
+   ls chr!{chr}_*_phased.vcf.gz | \
       sort -k1,1V > phased_VCF_list.tsv
-   //Merge the VCFs in order:
+   #Merge the VCFs in order:
    bcftools merge -m all -l phased_VCF_list.tsv -Oz -o chr!{chr}_persample_phased.vcf.gz 2> bcftools_merge_persample_chr!{chr}.stderr > bcftools_merge_persample_chr!{chr}.stdout
    tabix -f chr!{chr}_persample_phased.vcf.gz
    '''
@@ -218,29 +221,29 @@ process shapeit {
    tag "chr${chr}"
 
    cpus params.shapeit_cpus
-   memory { params.shapeit_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
+   memory { params.shapeit_mem.plus(task.attempt.minus(1).multiply(16))+' GB' }
    time { task.attempt == 2 ? '72h' : params.shapeit_timeout }
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.{log,stderr,stdout}'
-   publishDir path: "${params.output_dir}/phased_VCFs", mode: 'copy', pattern: '*_pop_phased.vcf.g{z,z.tbi}', saveAs: { ${params.final_prefix}+it }
+   publishDir path: "${params.output_dir}/phased_VCFs", mode: 'copy', pattern: '*_pop_phased.vcf.g{z,z.tbi}', saveAs: { params.final_prefix+it }
 
    input:
    tuple val(chr), path("chr${chr}_persample_phased.vcf.gz"), path("chr${chr}_persample_phased.vcf.gz.tbi"), path(genmap) from whatshap_merged_vcfs.join(genmaps, by: 0)
 
    output:
    tuple path("shapeit4_pop_phasing_chr${chr}.log"), path("shapeit4_pop_phasing_chr${chr}.stderr"), path("shapeit4_pop_phasing_chr${chr}.stdout") into shapeit_logs
-   tuple val(chr), path("chr${chr}_pop_phased.vcf.gz"), path("chr${chr}_pop_phased.vcf.gz.tbi") into shapeit_phased_vcfs
+   tuple val(chr), val("shapeit4"), path("chr${chr}_pop_phased.vcf.gz"), path("chr${chr}_pop_phased.vcf.gz.tbi") into shapeit_phased_vcfs
 
    shell:
-   shapeit_params = "--sequencing --use-PS ${ps_errorrate} --seed ${params.prng_seed}"
-   shapeit_params = "${shapeit_params} --mcmc-iterations ${mcmc_scheme} --pbwt-depth ${pbwt_depth}"
+   shapeit_params = """--sequencing --use-PS ${params.ps_errorrate} --seed ${params.prng_seed} \
+                       --mcmc-iterations ${params.mcmc_scheme} --pbwt-depth ${params.pbwt_depth}"""
    '''
    module load !{params.mod_htslib}
    module load !{params.mod_miniconda}
    conda activate shapeit4
-   shapeit4 -M !{genmap} -R !{chr} !{shapeit_params} --thread !{task.cpus} -I chr!{chr}_persample_phased.vcf.gz -o chr!{chr}_pop_phased.vcf.gz --log shapeit4_pop_phasing_chr!{chr}.log 2> shapeit4_pop_phasing_chr!{chr}.stderr > shapeit4_pop_phasing_chr!{chr}.stdout
+   shapeit4 -M !{genmap} -R !{chr} !{shapeit_params} --thread !{task.cpus} -I chr!{chr}_persample_phased.vcf.gz -O chr!{chr}_pop_phased.vcf.gz --log shapeit4_pop_phasing_chr!{chr}.log 2> shapeit4_pop_phasing_chr!{chr}.stderr > shapeit4_pop_phasing_chr!{chr}.stdout
    tabix -f chr!{chr}_pop_phased.vcf.gz
    '''
 }
@@ -249,25 +252,26 @@ process phasing_stats {
    tag "chr${chr}"
 
    cpus params.phasing_stats_cpus
-   memory { params.phasing_stats_mem.plus(1).plus(task.attempt.minus(1).multiply(4))+' GB' }
+   memory { params.phasing_stats_mem.plus(task.attempt.minus(1).multiply(4))+' GB' }
    time { task.attempt == 2 ? '48h' : params.phasing_stats_timeout }
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
-   publishDir path: "${params.output_dir}/phasing" mode: 'copy', pattern: '*.{tsv.gtf}'
+   publishDir path: "${params.output_dir}/phasing", mode: 'copy', pattern: '*.tsv'
+   publishDir path: "${params.output_dir}/phasing", mode: 'copy', pattern: '*.gtf'
 
    input:
-   tuple val(chr), val(src), path(vcf) from whatshap_phased_vcfs.map({ [it[0], "whatshap", it[1]] }).mix(shapeit_phased_vcfs.map({ [it[0], "shapeit4", it[1]] }))
+   tuple val(chr), val(phasesrc), path(vcf), path(tbi) from whatshap_phased_vcfs.mix(shapeit_phased_vcfs)
 
    output:
-   tuple path("whatshap_stats_chr${chr}_${src}.stderr"), path("whatshap_stats_chr${chr}_${src}.stdout") into whatshap_stats_logs
-   tuple path("${params.final_prefix}_chr${chr}_${src}_phasing_stats.tsv"), path("${params.final_prefix}_chr${chr}_${src}_haplotype_blocks.gtf") into whatshap_stats_output
+   tuple path("whatshap_stats_chr${chr}_${phasesrc}.stderr"), path("whatshap_stats_chr${chr}_${phasesrc}.stdout") into whatshap_stats_logs
+   tuple path("${params.final_prefix}_chr${chr}_${phasesrc}_phasing_stats.tsv"), path("${params.final_prefix}_chr${chr}_${phasesrc}_haplotype_blocks.gtf") into whatshap_stats_output
 
    shell:
    '''
    module load !{params.mod_miniconda}
    conda activate whatshap
-   whatshap stats --tsv=!{params.final_prefix}_chr!{chr}_!{src}_phasing_stats.tsv --gtf=!{params.final_prefix}_chr!{chr}_!{src}_haplotype_blocks.gtf !{vcf} 2> whatshap_stats_chr!{chr}_!{src}.stderr > whatshap_stats_chr!{chr}_!{src}.stdout
+   whatshap stats --tsv=!{params.final_prefix}_chr!{chr}_!{phasesrc}_phasing_stats.tsv --gtf=!{params.final_prefix}_chr!{chr}_!{phasesrc}_haplotype_blocks.gtf !{vcf} 2> whatshap_stats_chr!{chr}_!{phasesrc}.stderr > whatshap_stats_chr!{chr}_!{phasesrc}.stdout
    '''
 }
