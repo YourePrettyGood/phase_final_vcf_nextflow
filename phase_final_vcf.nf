@@ -1,7 +1,6 @@
 #!/usr/bin/env nextflow
 /* Pipeline for phasing per-chromosome jointly genotyped VCFs (filtered)    *
  * Core steps:                                                              *
- *  Extract only sites PASSing filters ->                                   *
  *  Unphase input genotypes and split by modern sample (and index each) ->  *
  *  Single-sample phasing with WhatsHap using BQSR BAMs ->                  *
  *  Merge single-sample phased VCFs into joint VCF (minus arc+PanTro) ->    *
@@ -89,10 +88,10 @@ if (params.faster_shapeit > 0) {
 }
 
 //Defaults for cpus, memory, and time for each process:
-//Filter for PASS, unphase, and split
-params.filter_split_cpus = 1
-params.filter_split_mem = 8
-params.filter_split_timeout = '24h'
+//Unphase, and split
+params.unphase_split_cpus = 1
+params.unphase_split_mem = 8
+params.unphase_split_timeout = '24h'
 //Whatshap per-sample per-chromosome phasing
 params.whatshap_cpus = 1
 params.whatshap_mem = 4
@@ -110,12 +109,12 @@ params.phasing_stats_cpus = 1
 params.phasing_stats_mem = 4
 params.phasing_stats_timeout = '24h'
 
-process filter_and_split {
+process unphase_and_split {
    tag "${chr}"
 
-   cpus params.filter_split_cpus
-   memory { params.filter_split_mem.plus(task.attempt.minus(1).multiply(4))+' GB' }
-   time { task.attempt == 2 ? '48h' : params.filter_split_timeout }
+   cpus params.unphase_split_cpus
+   memory { params.unphase_split_mem.plus(task.attempt.minus(1).multiply(4))+' GB' }
+   time { task.attempt == 2 ? '48h' : params.unphase_split_timeout }
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
 
@@ -125,7 +124,7 @@ process filter_and_split {
    tuple val(chr), path(vcf), path(tbi) from vcfs.join(tbis, by: 0, failOnMismatch: true)
 
    output:
-   tuple path("bcftools_query_listsamples_chr${chr}.stderr"), path("bcftools_view_filterPASS_chr${chr}.stderr"), path("whatshap_unphase_chr${chr}.stderr"), path("bcftools_split_chr${chr}.stderr"), path("bcftools_split_chr${chr}.stdout") into filter_split_logs
+   tuple path("bcftools_query_listsamples_chr${chr}.stderr"), path("whatshap_unphase_chr${chr}.stderr"), path("bcftools_split_chr${chr}.stderr"), path("bcftools_split_chr${chr}.stdout") into unphase_split_logs
    path("chr${chr}_*_unphased.vcf.gz") into unphased_persample_vcfs mode flatten
    path("chr${chr}_*_unphased.vcf.gz.tbi") into unphased_persample_tbis mode flatten
 
@@ -134,14 +133,14 @@ process filter_and_split {
    module load !{params.mod_bcftools}
    module load !{params.mod_htslib}
    module load !{params.mod_miniconda}
+   #Load the conda environment for whatshap:
    conda activate whatshap
    #Set up the per-sample per-chromosome VCFs for whatshap:
    #First we need a sample map TSV:
    bcftools query -l !{vcf} 2> bcftools_query_listsamples_chr!{chr}.stderr | \
       !{projectDir}/samples_to_map_noArcPanTro.awk -v "chrom=!{chr}" > sample_VCF_map.tsv
-   #Now do the filtering, removal of phasing from GATK, and splitting by sample:
-   bcftools view -f PASS !{vcf} 2> bcftools_view_filterPASS_chr!{chr}.stderr | \
-      whatshap unphase - 2> whatshap_unphase_chr!{chr}.stderr | \
+   #Now do the removal of phasing from GATK and splitting by sample:
+   whatshap unphase !{vcf} 2> whatshap_unphase_chr!{chr}.stderr | \
       bcftools +split -S sample_VCF_map.tsv -Oz -o . 2> bcftools_split_chr!{chr}.stderr > bcftools_split_chr!{chr}.stdout
    #Remember to index the split VCFs:
    for i in chr*_unphased.vcf.gz;
@@ -163,7 +162,14 @@ process whatshap {
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
-   tuple val(id), val(chr), path("chr${chr}_${id}_unphased.vcf.gz"), path("chr${chr}_${id}_unphased.vcf.gz.tbi"), path(bam), path(bai) from unphased_persample_vcfs.flatten().map({ vcf -> [(vcf.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][2], (vcf.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][1], vcf] }).join(unphased_persample_tbis.flatten().map({ tbi -> [(tbi.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][2], (tbi.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][1], tbi] }), by: [0,1], failOnMismatch: true).combine(bams.join(bais, by: 0, failOnMismatch: true), by: 0)
+   tuple val(id), val(chr), path("chr${chr}_${id}_unphased.vcf.gz"), path("chr${chr}_${id}_unphased.vcf.gz.tbi"), path(bam), path(bai) from unphased_persample_vcfs
+      .flatten()
+      .map({ vcf -> [(vcf.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][2], (vcf.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][1], vcf] })
+      .join(unphased_persample_tbis
+         .flatten()
+         .map({ tbi -> [(tbi.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][2], (tbi.getSimpleName() =~ ~/^chr(\p{Alnum}+)_([a-zA-Z0-9_-]+)_unphased/)[0][1], tbi] }), by: [0,1], failOnMismatch: true)
+      .combine(bams
+         .join(bais, by: 0, failOnMismatch: true), by: 0)
    path ref
    path ref_fai
 
@@ -195,8 +201,13 @@ process merge {
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
-   tuple val(chr), path("*") from phased_persample_vcfs.groupTuple(sort: true, size: num_samples)
-   tuple val(tbi_chr), path("*") from phased_persample_tbis.groupTuple(sort: true, size: num_samples)
+   tuple val(chr), path(input_paths) from phased_persample_vcfs
+      .collectFile() { [ it[0]+".txt", it[1].getSimpleName()+'\t'+it[1].getName()+'\t'+it[1]+'\n' ] }
+      .map({ [it.getSimpleName(), it] })
+//   path("whatshap_vcf_paths.tsv") phased_persample_vcfs.collectFile() { [ "whatshap_vcf_paths.tsv", it.getSimpleName()+'\t'+it.getName()+'\t'+it+'\n' ] }
+//   path("whatshap_tbi_paths.tsv") phased_persample_tbis.collectFile() { [ "whatshap_tbi_paths.tsv", it.getSimpleName()+'\t'+it.getName()+'\t'+it+'\n' ] }
+//   tuple val(chr), path("*") from phased_persample_vcfs.groupTuple(sort: true, size: num_samples)
+//   tuple val(tbi_chr), path("*") from phased_persample_tbis.groupTuple(sort: true, size: num_samples)
 
    output:
    tuple path("bcftools_merge_persample_chr${chr}.stderr"), path("bcftools_merge_persample_chr${chr}.stdout") into merge_logs
@@ -207,6 +218,13 @@ process merge {
    '''
    module load !{params.mod_bcftools}
    module load !{params.mod_htslib}
+   #Symlink the input files, since SLURM dislikes the big SBATCH files that
+   # Nextflow creates when there are hundreds/thousands of inputs:
+   while read -a a;
+      do
+      ln -s ${a[2]} ${a[1]};
+      ln -s ${a[2]}.tbi ${a[1]}.tbi;
+   done < !{input_paths}
    #Re-join the per-sample VCFs into one phased merged VCF (without archaics/PanTro):
    #Generate the sorted list of VCFs:
    ls chr!{chr}_*_phased.vcf.gz | \
@@ -258,20 +276,22 @@ process phasing_stats {
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
-   publishDir path: "${params.output_dir}/phasing", mode: 'copy', pattern: '*.tsv'
-   publishDir path: "${params.output_dir}/phasing", mode: 'copy', pattern: '*.gtf'
+   publishDir path: "${params.output_dir}/phasing", mode: 'copy', pattern: '*.{tsv,gtf}'
+   publishDir path: "${params.output_dir}/phasing", mode: 'copy', pattern: 'bcftools_trioswitchrate_*.stdout'
 
    input:
    tuple val(chr), val(phasesrc), path(vcf), path(tbi) from whatshap_phased_vcfs.mix(shapeit_phased_vcfs)
 
    output:
-   tuple path("whatshap_stats_chr${chr}_${phasesrc}.stderr"), path("whatshap_stats_chr${chr}_${phasesrc}.stdout") into whatshap_stats_logs
-   tuple path("${params.final_prefix}_chr${chr}_${phasesrc}_phasing_stats.tsv"), path("${params.final_prefix}_chr${chr}_${phasesrc}_haplotype_blocks.gtf") into whatshap_stats_output
+   tuple path("whatshap_stats_chr${chr}_${phasesrc}.stderr"), path("whatshap_stats_chr${chr}_${phasesrc}.stdout"), path("bcftools_trioswitchrate_chr${chr}_${phasesrc}.stderr"), path("bcftools_trioswitchrate_chr${chr}_${phasesrc}.stdout") into whatshap_stats_logs
+   tuple path("${params.final_prefix}_chr${chr}_${phasesrc}_phasing_stats.tsv"), path("${params.final_prefix}_chr${chr}_${phasesrc}_haplotype_blocks.gtf"), path("bcftools_trioswitchrate_chr${chr}_${phasesrc}.stdout") into whatshap_stats_output
 
    shell:
    '''
+   module load !{params.mod_bcftools}
    module load !{params.mod_miniconda}
    conda activate whatshap
    whatshap stats --tsv=!{params.final_prefix}_chr!{chr}_!{phasesrc}_phasing_stats.tsv --gtf=!{params.final_prefix}_chr!{chr}_!{phasesrc}_haplotype_blocks.gtf !{vcf} 2> whatshap_stats_chr!{chr}_!{phasesrc}.stderr > whatshap_stats_chr!{chr}_!{phasesrc}.stdout
+   bcftools +trio-switch-rate !{vcf} -- -p !{trioped} 2> bcftools_trioswitchrate_chr!{chr}_!{phasesrc}.stderr > bcftools_trioswitchrate_chr!{chr}_!{phasesrc}.stdout
    '''
 }
