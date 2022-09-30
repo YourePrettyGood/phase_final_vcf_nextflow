@@ -19,6 +19,10 @@ params.vcf_regex = ~/^.+_chr(\p{Alnum}+)$/
 //Reference-related parameters for the pipeline:
 params.ref_prefix = "/gpfs/gibbs/pi/tucci/pfr8/refs"
 params.ref = "${params.ref_prefix}/1kGP/hs37d5/hs37d5.fa"
+//X chromosome ID:
+params.sex_chrom = "X"
+//File of sample sexes:
+params.sex_metadata = ""
 
 //Set up the channels of BAMs and their indices:
 //This variable is just used to allow merging to occur asynchronously for the chromosomes, rather than waiting for all whatshap jobs to finish:
@@ -59,6 +63,8 @@ Channel
 ref = file(params.ref, checkIfExists: true)
 ref_dict = file(params.ref.replaceFirst("[.]fn?a(sta)?([.]gz)?", ".dict"), checkIfExists: true)
 ref_fai = file(params.ref+'.fai', checkIfExists: true)
+//Set up the file channel for the sex metadata:
+sex_metadata = file(params.sex_metadata, checkIfExists: true)
 
 //Set up the channel for the genetic map:
 Channel
@@ -140,8 +146,17 @@ process unphase_and_split {
    bcftools query -l !{vcf} 2> bcftools_query_listsamples_chr!{chr}.stderr | \
       !{projectDir}/samples_to_map_noArcPanTro.awk -v "chrom=!{chr}" > sample_VCF_map.tsv
    #Now do the removal of phasing from GATK and splitting by sample:
-   whatshap unphase !{vcf} 2> whatshap_unphase_chr!{chr}.stderr | \
-      bcftools +split -S sample_VCF_map.tsv -Oz -o . 2> bcftools_split_chr!{chr}.stderr > bcftools_split_chr!{chr}.stdout
+   #We force the ploidy of all samples for the X to be 2 for phasing.
+   #Also, whatshap unphase errors out if not all diploid genotypes,
+   # but doesn't give non-zero exit code, so let's bypass that issue.
+   if [[ "!{chr}" == "!{params.sex_chrom}" ]]; then
+      bcftools +fixploidy !{vcf} -- -t GT -f 2 2> bcftools_fixploidy_chr!{chr}.stderr | \
+         whatshap unphase - 2> whatshap_unphase_chr!{chr}.stderr | \
+         bcftools +split -S sample_VCF_map.tsv -Oz -o . 2> bcftools_split_chr!{chr}.stderr > bcftools_split_chr!{chr}.stdout
+   else
+      whatshap unphase !{vcf} 2> whatshap_unphase_chr!{chr}.stderr | \
+         bcftools +split -S sample_VCF_map.tsv -Oz -o . 2> bcftools_split_chr!{chr}.stderr > bcftools_split_chr!{chr}.stdout
+   fi
    #Remember to index the split VCFs:
    for i in chr*_unphased.vcf.gz;
    do
@@ -258,10 +273,16 @@ process shapeit {
    shapeit_params = """--sequencing --use-PS ${params.ps_errorrate} --seed ${params.prng_seed} \
                        --mcmc-iterations ${params.mcmc_scheme} --pbwt-depth ${params.pbwt_depth}"""
    '''
+   module load !{params.mod_bcftools}
    module load !{params.mod_htslib}
    module load !{params.mod_miniconda}
    conda activate shapeit4
-   shapeit4 -M !{genmap} -R !{chr} !{shapeit_params} --thread !{task.cpus} -I chr!{chr}_persample_phased.vcf.gz -O chr!{chr}_pop_phased.vcf.gz --log shapeit4_pop_phasing_chr!{chr}.log 2> shapeit4_pop_phasing_chr!{chr}.stderr > shapeit4_pop_phasing_chr!{chr}.stdout
+   if [[ "!{chr}" == "!{params.sex_chrom}" ]]; then
+      shapeit4 -M !{genmap} -R !{chr} !{shapeit_params} --thread !{task.cpus} -I chr!{chr}_persample_phased.vcf.gz -O chr!{chr}_pop_phased_forceddiploid.vcf.gz --log shapeit4_pop_phasing_chr!{chr}.log 2> shapeit4_pop_phasing_chr!{chr}.stderr > shapeit4_pop_phasing_chr!{chr}.stdout
+      bcftools +fixploidy -Oz -o chr!{chr}_pop_phased.vcf.gz chr!{chr}_pop_phased_forceddiploid.vcf.gz -- -s !{sex_metadata} -t GT 2> bcftools_fixploidy_undo_chr!{chr}.stderr > bcftools_fixploidy_undo_chr!{chr}.stdout
+   else
+      shapeit4 -M !{genmap} -R !{chr} !{shapeit_params} --thread !{task.cpus} -I chr!{chr}_persample_phased.vcf.gz -O chr!{chr}_pop_phased.vcf.gz --log shapeit4_pop_phasing_chr!{chr}.log 2> shapeit4_pop_phasing_chr!{chr}.stderr > shapeit4_pop_phasing_chr!{chr}.stdout
+   fi
    tabix -f chr!{chr}_pop_phased.vcf.gz
    '''
 }
