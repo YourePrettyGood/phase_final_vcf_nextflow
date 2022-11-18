@@ -83,6 +83,7 @@ Channel
    .map { [ it.SampleID, it.Batch ] }
    .ifEmpty { error "Sample metadata file is missing columns named SampleID and AnalysisGroup" }
    .tap { sample_groups }
+   .tap { samples_for_stats }
    .subscribe { println "Added ${it[0]} -> ${it[1]} to sample_groups channel" }
 
 //Set up the channel for the genetic map:
@@ -127,6 +128,10 @@ params.merge_timeout = '24h'
 params.shapeit_cpus = 1
 params.shapeit_mem = 64
 params.shapeit_timeout = '24h'
+//Trio switching stats
+params.trio_stats_cpus = 1
+params.trio_stats_mem = 1
+params.trio_stats_timeout = '24h'
 //Whatshap phasing stats
 params.phasing_stats_cpus = 16
 params.phasing_stats_mem = 16
@@ -338,8 +343,38 @@ process tx_phased_gts {
    '''
 }
 
+whatshap_stats_vcfs = whatshap_phased_vcfs
+   .mix(shapeit_phased_vcfs)
+   .mix(tx_phased_gts_vcfs)
+   .tap { trio_stats_vcfs }
+
+process trio_stats {
+   tag "chr${chr} ${phasesrc}"
+
+   cpus params.trio_stats_cpus
+   memory { params.trio_stats_mem.plus(task.attempt.minus(1).multiply(4))+' GB' }
+   time { task.attempt >= 2 ? '48h' : params.trio_stats_timeout }
+   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
+   maxRetries 1
+
+   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
+   publishDir path: "${params.output_dir}/phasing", mode: 'copy', pattern: 'bcftools_trioswitchrate_*.stdout'
+
+   input:
+   tuple val(chr), val(phasesrc), path(vcf), path(tbi) from trio_stats_vcfs
+
+   output:
+   tuple path("bcftools_trioswitchrate_chr${chr}_${phasesrc}.stderr"), path("bcftools_trioswitchrate_chr${chr}_${phasesrc}.stdout") into trio_stats_logs
+
+   shell:
+   '''
+   module load !{params.mod_bcftools}
+   bcftools +trio-switch-rate !{vcf} -- -p !{trioped} 2> bcftools_trioswitchrate_chr!{chr}_!{phasesrc}.stderr > bcftools_trioswitchrate_chr!{chr}_!{phasesrc}.stdout
+   '''
+}
+
 process phasing_stats {
-   tag "chr${chr}"
+   tag "chr${chr} ${phasesrc} ${sample}"
 
    cpus params.phasing_stats_cpus
    memory { params.phasing_stats_mem.plus(task.attempt.minus(1).multiply(4))+' GB' }
@@ -348,49 +383,20 @@ process phasing_stats {
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
-   publishDir path: "${params.output_dir}/phasing", mode: 'copy', pattern: '*.{tsv,gtf}.tar.gz'
-   publishDir path: "${params.output_dir}/phasing", mode: 'copy', pattern: 'bcftools_trioswitchrate_*.stdout'
+   publishDir path: "${params.output_dir}/phasing", mode: 'copy', pattern: '*.{tsv,gtf}'
 
    input:
-   tuple val(chr), val(phasesrc), path(vcf), path(tbi) from whatshap_phased_vcfs.mix(shapeit_phased_vcfs).mix(tx_phased_gts_vcfs)
+   tuple val(chr), val(phasesrc), path(vcf), path(tbi), val(sample) from whatshap_stats_vcfs.combine(samples_for_stats.map({ it[0] }))
 
    output:
-   tuple path("bcftools_view_chr${chr}_${phasesrc}.stderr"), path("whatshap_stats_chr${chr}_${phasesrc}.stderr"), path("whatshap_stats_chr${chr}_${phasesrc}.stdout"), path("bcftools_trioswitchrate_chr${chr}_${phasesrc}.stderr"), path("bcftools_trioswitchrate_chr${chr}_${phasesrc}.stdout") into whatshap_stats_logs
-   tuple path("${params.final_prefix}_chr${chr}_${phasesrc}_phasing_stats.tsv.tar.gz"), path("${params.final_prefix}_chr${chr}_${phasesrc}_haplotype_blocks.gtf.tar.gz"), path("bcftools_trioswitchrate_chr${chr}_${phasesrc}.stdout") into whatshap_stats_output
+   tuple path("bcftools_view_chr${chr}_${sample}_${phasesrc}.stderr"), path("whatshap_stats_chr${chr}_${sample}_${phasesrc}.stderr"), path("whatshap_stats_chr${chr}_${sample}_${phasesrc}.stdout") into whatshap_stats_logs
+   tuple path("${params.final_prefix}_chr${chr}_${sample}_${phasesrc}_phasing_stats.tsv"), path("${params.final_prefix}_chr${chr}_${sample}_${phasesrc}_haplotype_blocks.gtf") into whatshap_stats_output
 
    shell:
    '''
    module load !{params.mod_bcftools}
-   module load !{params.mod_parallel}
    module load !{params.mod_miniconda}
    conda activate whatshap
-   bcftools +trio-switch-rate !{vcf} -- -p !{trioped} 2> bcftools_trioswitchrate_chr!{chr}_!{phasesrc}.stderr > bcftools_trioswitchrate_chr!{chr}_!{phasesrc}.stdout
-   bcftools query -l !{vcf} > vcf_sample_IDs.txt
-   parallel -j!{task.cpus} '/usr/bin/time -v bcftools view -r !{chr} -s {1} -Ou !{vcf} 2> bcftools_view_chr!{chr}_{1}_!{phasesrc}.stderr | /usr/bin/time -v whatshap stats --tsv=!{params.final_prefix}_chr!{chr}_{1}_!{phasesrc}_phasing_stats.tsv --gtf=!{params.final_prefix}_chr!{chr}_{1}_!{phasesrc}_haplotype_blocks.gtf --sample={1} --chromosome=!{chr} - 2> whatshap_stats_chr!{chr}_{1}_!{phasesrc}.stderr > whatshap_stats_chr!{chr}_{1}_!{phasesrc}.stdout' :::: vcf_sample_IDs.txt
-   find . -name "*_phasing_stats.tsv" -print | sort -k1,1V > phasing_stats_tsv.fofn
-   tar -czf !{params.final_prefix}_chr!{chr}_!{phasesrc}_phasing_stats.tsv.tar.gz -T phasing_stats_tsv.fofn
-   find . -name "*_haplotype_blocks.gtf" -print | sort -k1,1V > haplotype_blocks_gtf.fofn
-   tar -czf !{params.final_prefix}_chr!{chr}_!{phasesrc}_haplotype_blocks.gtf.tar.gz -T haplotype_blocks_gtf.fofn
-   find . -name "bcftools_view_chr!{chr}_*_!{phasesrc}.stderr" -print | \
-      sort -k1,1V | \
-      while read a;
-         do
-         echo "${a}";
-         cat ${a};
-      done > bcftools_view_chr!{chr}_!{phasesrc}.stderr
-   find . -name "whatshap_stats_chr!{chr}_*_!{phasesrc}.stderr" -print | \
-      sort -k1,1V | \
-      while read a;
-         do
-         echo "${a}";
-         cat ${a};
-      done > whatshap_stats_chr!{chr}_!{phasesrc}.stderr
-   find . -name "whatshap_stats_chr!{chr}_*_!{phasesrc}.stdout" -print | \
-      sort -k1,1V | \
-      while read a;
-         do
-         echo "${a}";
-         cat ${a};
-      done > whatshap_stats_chr!{chr}_!{phasesrc}.stdout
+   /usr/bin/time -v bcftools view -r !{chr} -s !{sample} -Ou !{vcf} 2> bcftools_view_chr!{chr}_!{sample}_!{phasesrc}.stderr | /usr/bin/time -v whatshap stats --tsv=!{params.final_prefix}_chr!{chr}_!{sample}_!{phasesrc}_phasing_stats.tsv --gtf=!{params.final_prefix}_chr!{chr}_!{sample}_!{phasesrc}_haplotype_blocks.gtf --sample=!{sample} --chromosome=!{chr} - 2> whatshap_stats_chr!{chr}_!{sample}_!{phasesrc}.stderr > whatshap_stats_chr!{chr}_!{sample}_!{phasesrc}.stdout
    '''
 }
