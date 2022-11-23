@@ -397,6 +397,13 @@ process phasing_stats {
    module load !{params.mod_bcftools}
    module load !{params.mod_miniconda}
    conda activate whatshap
-   /usr/bin/time -v bcftools view -r !{chr} -s !{sample} -Ou !{vcf} 2> bcftools_view_chr!{chr}_!{sample}_!{phasesrc}.stderr | /usr/bin/time -v whatshap stats --tsv=!{params.final_prefix}_chr!{chr}_!{sample}_!{phasesrc}_phasing_stats.tsv --gtf=!{params.final_prefix}_chr!{chr}_!{sample}_!{phasesrc}_haplotype_blocks.gtf --sample=!{sample} --chromosome=!{chr} - 2> whatshap_stats_chr!{chr}_!{sample}_!{phasesrc}.stderr > whatshap_stats_chr!{chr}_!{sample}_!{phasesrc}.stdout
+   if [[ "!{chr}" == "!{params.sex_chrom}" ]]; then
+      /usr/bin/time -v bcftools view -r !{chr} -s !{sample} -Ou !{vcf} 2> bcftools_view_chr!{chr}_!{sample}_!{phasesrc}.stderr | \
+         /usr/bin/time -v bcftools +fixploidy -Ou - -- -t GT -f 2 2> bcftools_fixploidy_forwhatshapstats_chr!{chr}.stderr | \
+         /usr/bin/time -v whatshap stats --tsv=!{params.final_prefix}_chr!{chr}_!{sample}_!{phasesrc}_phasing_stats.tsv --gtf=!{params.final_prefix}_chr!{chr}_!{sample}_!{phasesrc}_haplotype_blocks.gtf --sample=!{sample} --chromosome=!{chr} - 2> whatshap_stats_chr!{chr}_!{sample}_!{phasesrc}.stderr > whatshap_stats_chr!{chr}_!{sample}_!{phasesrc}.stdout
+   else
+      /usr/bin/time -v bcftools view -r !{chr} -s !{sample} -Ou !{vcf} 2> bcftools_view_chr!{chr}_!{sample}_!{phasesrc}.stderr | \
+         /usr/bin/time -v whatshap stats --tsv=!{params.final_prefix}_chr!{chr}_!{sample}_!{phasesrc}_phasing_stats.tsv --gtf=!{params.final_prefix}_chr!{chr}_!{sample}_!{phasesrc}_haplotype_blocks.gtf --sample=!{sample} --chromosome=!{chr} - 2> whatshap_stats_chr!{chr}_!{sample}_!{phasesrc}.stderr > whatshap_stats_chr!{chr}_!{sample}_!{phasesrc}.stdout
+   fi
    '''
 }
