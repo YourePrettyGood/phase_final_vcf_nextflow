@@ -1,0 +1,3 @@
+[submodule "dedup_merged_BAMs"]
+	path = dedup_merged_BAMs
+	url = git@github.com:YourePrettyGood/dedup_merged_BAMs.git
